@@ -3,7 +3,7 @@
 # (обучение, отбор фич, отчёты). Это ускоряет импорты в лёгких модулях.
 
 # Стандартные
-import os, json, math, time, gc, itertools
+import os, json, math, time, gc, itertools, argparse
 from datetime import datetime, date, timedelta
 from pathlib import Path
 from functools import partial
@@ -13,6 +13,8 @@ from dataclasses import dataclass
 from datetime import date as date_cls
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
+import lightgbm as lgb
+
 
 
 # Научный стек

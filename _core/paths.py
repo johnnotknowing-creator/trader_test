@@ -20,6 +20,9 @@ TOOLS_DIR   = PROJECT_ROOT / "_tools"
 CORE_DIR    = PROJECT_ROOT / "_core"
 CONFIGS_DIR = PROJECT_ROOT / "configs"
 
+FEATURES_DIR_RAW       = RESULTS_DIR / "featuresets" # Сюда кладем фичи ПОСЛЕ feature_generator
+FEATURES_DIR_PROCESSED = RESULTS_DIR / "features_processed" # Сюда кладем фичи ПОСЛЕ разметки (labeler)
+
 # Гарантируем, что проект и _core в sys.path (на случай запуска скриптов из подпапок)
 for p in (str(PROJECT_ROOT), str(CORE_DIR), str(TOOLS_DIR)):
     if p not in sys.path:
@@ -31,11 +34,15 @@ def rel(*parts: Union[str, Path]) -> Path:
     return PROJECT_ROOT.joinpath(*parts)
 
 def ensure_dirs() -> None:
-    "Создаёт стандартные папки результатов, если их нет"
+    "Создаёт стандартные папки данных и результатов, если их нет"
     for p in [
+        # --- 👇 ВОТ ИСПРАВЛЕНИЕ 👇 ---
+        DATA_DIR,
+        # ---------------------------
         RESULTS_DIR,
         RESULTS_DIR / "features",
         RESULTS_DIR / "featuresets",
+        RESULTS_DIR / "features_processed",
         RESULTS_DIR / "models",
         RESULTS_DIR / "reports",
         RESULTS_DIR / "notebooks",

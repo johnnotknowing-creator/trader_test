@@ -1,333 +1,184 @@
 # _tools/universal_downloader.py
-# Загрузка дневной истории акций с MOEX ISS и сохранение в CSV.
-# Сохраняет файлы в формате: <SYMBOL>_D1_MOEX.csv
-# Без TensorFlow. Полная пагинация через history.cursor (JSON), без пустых CSV
-# и без «пустых» свечей (все OHLC NaN и volume==0 удаляются).
-
 from __future__ import annotations
+from typing import Optional
+from datetime import datetime, date
+import os
+import time
+import json
+import random
+import warnings
 
-# Базовые пути/инициализация проекта
 from _core.paths import PROJECT_ROOT, ensure_dirs, load_dotenv_if_exists
-
-# Централизованные импорты и утилиты (numpy/pandas/requests/tqdm/…, multiprocessing, partial, relativedelta)
 from _core.libs import *
+import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 load_dotenv_if_exists()
 ensure_dirs()
 
+MOEX_BASE = "https://iss.moex.com/iss/history/engines/stock/markets/shares/boards/{board}/securities"
+DEFAULT_BOARD = "TQBR"
 
-# ====== Настройки загрузчика ======
-class DownloaderConfig:
-    def __init__(
-        self,
-        years: int = 20,
-        data_dir: str = "1_data",
-        engine: str = "stock",
-        market: str = "shares",
-        board: str = "TQBR",
-        sleep_sec: float = 0.0,
-        processes: Optional[int] = None,
-    ) -> None:
-        self.years = years
-        self.data_dir = data_dir
-        self.engine = engine
-        self.market = market
-        self.board = board
-        self.sleep_sec = sleep_sec
-        self.processes = processes
+def _make_session() -> requests.Session:
+    s = requests.Session()
+    s.headers.update({"User-Agent": "trader_test/1.0"})
+    retries = Retry(total=5, backoff_factor=0.5, status_forcelist=[500, 502, 503, 504])
+    adapter = HTTPAdapter(pool_connections=50, pool_maxsize=50, max_retries=retries)
+    s.mount("https://", adapter)
+    s.mount("http://", adapter)
+    return s
 
-
-# ====== Пути/имена файлов (ВАШ ФОРМАТ) ======
-def _data_dir_path(cfg: DownloaderConfig) -> str:
-    p = PROJECT_ROOT / cfg.data_dir
-    os.makedirs(p, exist_ok=True)
-    return str(p)
-
-
-def _csv_path_for_symbol(symbol: str, cfg: DownloaderConfig) -> str:
-    # ВАШ формат: ABIO_D1_MOEX.csv
-    filename = f"{symbol}_D1_MOEX.csv"
-    return os.path.join(_data_dir_path(cfg), filename)
-
-
-# ====== HTTP-helpers: берём из libs, иначе локальные фоллбеки ======
-def _get_session_and_getter():
-    """
-    Возвращает (session, http_get_text) — либо из _core.libs,
-    либо локальные устойчивые фоллбеки (чтобы скрипт не падал).
-    """
-    if "make_http_session" in globals() and callable(globals().get("make_http_session")) \
-       and "http_get_text" in globals() and callable(globals().get("http_get_text")):
-        return make_http_session(), http_get_text
-
-    # ---- Локальные фоллбеки (если не добавили в libs) ----
-    from requests.adapters import HTTPAdapter
-    from urllib3.util.retry import Retry
-
-    def _make_http_session_fallback() -> requests.Session:
-        s = requests.Session()
-        s.headers.update({"User-Agent": "Mozilla/5.0", "Connection": "close"})
-        retry = Retry(
-            total=5, connect=5, read=5,
-            backoff_factor=0.6,
-            status_forcelist=[429, 500, 502, 503, 504],
-            allowed_methods=["GET", "POST"],
-            raise_on_status=False,
-        )
-        adapter = HTTPAdapter(max_retries=retry, pool_connections=50, pool_maxsize=50)
-        s.mount("https://", adapter)
-        s.mount("http://", adapter)
-        return s
-
-    def _http_get_text_fallback(session: requests.Session, url: str, *, params=None,
-                                timeout: float = 30.0, max_attempts: int = 5, sleep_base: float = 0.5) -> str:
-        exc = None
-        for i in range(max_attempts):
-            try:
-                resp = session.get(url, params=params, timeout=timeout)
-                if resp.status_code == 200:
-                    _ = resp.content  # читаем тело, чтобы поймать SSL/Chunked ошибки здесь
-                    return resp.text
-            except (requests.exceptions.SSLError,
-                    requests.exceptions.ChunkedEncodingError,
-                    requests.exceptions.ConnectionError) as e:
-                exc = e
-            time.sleep(sleep_base * (2 ** i))
-            try:
-                session.close()
-            except Exception:
-                pass
-            session = _make_http_session_fallback()
-        raise RuntimeError(f"HTTP GET failed after retries for {url}: {exc}")
-
-    return _make_http_session_fallback(), _http_get_text_fallback
-
-
-# ====== Чтение/нормализация существующего CSV ======
-def _safe_read_csv(path: str) -> pd.DataFrame | None:
-    if not os.path.exists(path):
-        return None
+def _parse_moex_json(json_text: str) -> Optional[pd.DataFrame]:
     try:
-        df = pd.read_csv(path)
-    except Exception:
+        json_data = json.loads(json_text)
+        if not isinstance(json_data, list) or len(json_data) < 2: return None
+        data_dict = json_data[1]
+        if not isinstance(data_dict, dict): return None
+        history_data = data_dict.get('history')
+        if not history_data or not isinstance(history_data, list):
+            return pd.DataFrame() 
+        return pd.DataFrame(history_data)
+    except (json.JSONDecodeError, IndexError, AttributeError):
         return None
 
-    if "datetime" not in df.columns:
-        for alt in ("date", "timestamp", "time", "TRADEDATE"):
-            if alt in df.columns:
-                df = df.rename(columns={alt: "datetime"})
-                break
+def download_one_stock_history(
+    ticker: str, years: int, data_dir: str, board: str, sleep_sec: float
+) -> Tuple[str, str]:
+    warnings.simplefilter('ignore', FutureWarning)
+    if sleep_sec > 0:
+        time.sleep(random.uniform(0, sleep_sec))
 
-    if "datetime" in df.columns:
-        dt = pd.to_datetime(df["datetime"], utc=True, errors="coerce")
-        if pd.api.types.is_numeric_dtype(df["datetime"]):
-            vals = df["datetime"].astype("float64")
-            unit = "ms" if np.nanmedian(vals) > 1e11 else "s"
-            dt = pd.to_datetime(vals, unit=unit, utc=True, errors="coerce")
-        df["datetime"] = dt
-
-    return df
-
-
-def _last_date_from_existing(df: pd.DataFrame | None) -> date | None:
-    if df is None or df.empty or "datetime" not in df.columns:
-        return None
-    dt = pd.to_datetime(df["datetime"], utc=True, errors="coerce").dropna()
-    if dt.empty:
-        return None
-    return dt.max().date()
-
-
-# ====== Удаление «пустых» свечей ======
-def _drop_blank_ohlcv_rows(df: pd.DataFrame) -> pd.DataFrame:
-    for c in ["open", "high", "low", "close", "volume"]:
-        if c in df.columns:
-            df[c] = pd.to_numeric(df[c], errors="coerce")
-    mask_prices_all_nan = df[["open", "high", "low", "close"]].isna().all(axis=1)
-    mask_zero_vol = df["volume"].fillna(0).eq(0)
-    mask_blank = mask_prices_all_nan & mask_zero_vol
-    return df.loc[~mask_blank].copy()
-
-
-# ====== Нормализация формата истории ======
-def _normalize_history_df(df: pd.DataFrame) -> pd.DataFrame:
-    rename = {
-        "TRADEDATE": "datetime",
-        "OPEN": "open",
-        "HIGH": "high",
-        "LOW": "low",
-        "CLOSE": "close",
-        "VOLUME": "volume",
-        "tradedate": "datetime",
-    }
-    df = df.rename(columns=rename)
-    df = df.rename(columns={c: c.lower() for c in df.columns})
-
-    cols = ["datetime", "open", "high", "low", "close", "volume"]
-    for c in cols:
-        if c not in df.columns:
-            df[c] = np.nan
-
-    df["datetime"] = pd.to_datetime(df["datetime"], utc=True, errors="coerce").dt.normalize()
-    df = df.dropna(subset=["datetime"]).drop_duplicates(subset=["datetime"]).sort_values("datetime")
-    df = df[cols]
-    df = _drop_blank_ohlcv_rows(df)
-    return df
-
-
-# ====== Загрузка истории (JSON + history.cursor, полная пагинация) ======
-def _fetch_moex_history_full(symbol: str, start: pd.Timestamp, end: pd.Timestamp, cfg: DownloaderConfig) -> pd.DataFrame:
-    base = (
-        f"https://iss.moex.com/iss/history/engines/{cfg.engine}/markets/{cfg.market}"
-        f"/boards/{cfg.board}/securities/{symbol}.json"
-    )
-
-    session, _get_text = _get_session_and_getter()
-
-    params = {
-        "from": start.date().isoformat(),
-        "till": end.date().isoformat(),
-        "iss.meta": "off",
-        "lang": "ru",
-        "start": 0,
-    }
-
-    frames: List[pd.DataFrame] = []
-    total = None
-    page_size = 100  # уточним из history.cursor
-
-    while True:
-        resp = session.get(base, params=params, timeout=30)
-        if resp.status_code != 200:
-            ok = False
-            for _ in range(3):
-                time.sleep(0.8)
-                resp = session.get(base, params=params, timeout=30)
-                if resp.status_code == 200:
-                    ok = True
-                    break
-            if not ok:
-                break
-
+    # --- ИЗМЕНЕНИЕ 1: Новый формат имени файла ---
+    output_path = Path(PROJECT_ROOT) / data_dir / f"{ticker}_D1_MOEX.csv"
+    
+    start_date_str = (datetime.now() - relativedelta(years=years)).strftime("%Y-%m-%d")
+    existing_df = None
+    
+    # --- ИЗМЕНЕНИЕ 2: Логика инкрементальной загрузки ---
+    if output_path.exists():
         try:
-            js = resp.json()
+            existing_df = pd.read_csv(output_path)
+            last_date_in_file = pd.to_datetime(existing_df['datetime']).max().date()
+            # Запрашиваем данные, начиная со следующего дня
+            start_date_str = (last_date_in_file + timedelta(days=1)).strftime('%Y-%m-%d')
         except Exception:
-            time.sleep(0.5)
-            continue
+            # Если файл битый, скачиваем заново
+            existing_df = None
+            
+    # Если сегодня раньше даты начала запроса, то новых данных нет
+    if date.today() < datetime.strptime(start_date_str, '%Y-%m-%d').date():
+        return ticker, "no_new_data"
 
-        if "history" not in js or "columns" not in js["history"] or "data" not in js["history"]:
-            break
+    all_data = []
+    start_cursor = 0
+    session = _make_session()
+    
+    try:
+        while True:
+            url = MOEX_BASE.format(board=board) + f"/{ticker}.json"
+            params = {
+                'start': start_cursor, 'from': start_date_str, 'iss.json': 'extended',
+                'iss.meta': 'off', 'limit': 100, 'lang': 'ru'
+            }
+            response = session.get(url, params=params, timeout=30)
+            response.raise_for_status()
+            df_chunk = _parse_moex_json(response.text)
+            
+            if df_chunk is None: return ticker, "parse_error"
+            if df_chunk.empty: break
 
-        cols = js["history"]["columns"]
-        data = js["history"]["data"]
-        df = pd.DataFrame(data, columns=cols)
-        df = _normalize_history_df(df)
-        if not df.empty:
-            frames.append(df)
+            all_data.append(df_chunk)
+            start_cursor += len(df_chunk)
+            if len(df_chunk) < 100: break
+    except requests.RequestException:
+        session.close()
+        return ticker, "network_error"
+    
+    session.close()
 
-        if total is None and "history.cursor" in js:
-            cur = js["history.cursor"]
-            if "columns" in cur and "data" in cur and cur["data"]:
-                try:
-                    ccols = cur["columns"]
-                    crow = cur["data"][0]
-                    total_idx = ccols.index("TOTAL") if "TOTAL" in ccols else 0
-                    psize_idx = ccols.index("PAGESIZE") if "PAGESIZE" in ccols else 1
-                    total = int(crow[total_idx])
-                    page_size = int(crow[psize_idx])
-                except Exception:
-                    pass
+    # --- Логика объединения и сохранения ---
+    if not all_data:
+        return ticker, "no_new_data"
 
-        params["start"] = int(params["start"]) + page_size
-        if total is not None and int(params["start"]) >= total:
-            break
+    try:
+        new_df = pd.concat(all_data, ignore_index=True)
+        new_df.columns = [col.lower() for col in new_df.columns]
+        
+        rename_map = {
+            'tradedate': 'datetime', 'open': 'open', 'high': 'high',
+            'low': 'low', 'close': 'close', 'volume': 'volume'
+        }
+        required_cols = list(rename_map.keys())
+        if not all(col in new_df.columns for col in required_cols):
+            return ticker, "missing_cols"
 
-        if cfg.sleep_sec:
-            time.sleep(cfg.sleep_sec)
+        final_df = new_df[required_cols].rename(columns=rename_map)
+        
+        # Если были старые данные, объединяем
+        if existing_df is not None:
+            final_df = pd.concat([existing_df, final_df], ignore_index=True)
 
-    if not frames:
-        return pd.DataFrame(columns=["datetime", "open", "high", "low", "close", "volume"])
-
-    out = pd.concat(frames, ignore_index=True)
-    out = out.drop_duplicates(subset=["datetime"]).sort_values("datetime").reset_index(drop=True)
-    return out.loc[(out["datetime"] >= start.normalize()) & (out["datetime"] <= end.normalize())]
-
-
-# ====== Слияние и сохранение ======
-def _merge_and_save(save_path: str, df_new: pd.DataFrame) -> None:
-    df_new = _drop_blank_ohlcv_rows(df_new)
-    existing = _safe_read_csv(save_path)
-    if existing is None or existing.empty:
-        merged = df_new
-    else:
-        existing = _normalize_history_df(existing)
-        merged = pd.concat([existing, df_new], ignore_index=True)
-        merged = merged.drop_duplicates(subset=["datetime"]).sort_values("datetime").reset_index(drop=True)
-
-    merged = _drop_blank_ohlcv_rows(merged)
-    if merged.empty:
-        return  # не создаём пустой файл
-
-    merged["datetime"] = pd.to_datetime(merged["datetime"], utc=True, errors="coerce").dt.tz_convert(None)
-    merged.to_csv(save_path, index=False, date_format="%Y-%m-%dT%H:%M:%S")
-
-
-# ====== Публичные функции ======
-def download_and_save_ticker(
-    symbol: str,
-    *,
-    years: int = 20,
-    data_dir: str = "1_data",
-    board: str = "TQBR",
-    sleep_sec: float = 0.0,
-) -> Optional[str]:
-    """
-    Загружает историю по тикеру и сохраняет/дополняет CSV в формате <SYMBOL>_D1_MOEX.csv.
-    Если не удалось получить данные — возвращает None (и не создаёт пустых файлов).
-    """
-    cfg = DownloaderConfig(years=years, data_dir=data_dir, board=board, sleep_sec=sleep_sec)
-    save_path = _csv_path_for_symbol(symbol, cfg)
-
-    # tz-aware UTC timestamps, чтобы не было "tz-naive vs tz-aware"
-    end_ts = pd.Timestamp.now(tz="UTC").normalize()
-
-    last_date = _last_date_from_existing(_safe_read_csv(save_path))
-    if last_date is not None:
-        start_ts = pd.Timestamp(last_date, tz="UTC") + pd.Timedelta(days=1)
-        if start_ts > end_ts:
-            return save_path
-    else:
-        start_ts = end_ts - relativedelta(years=cfg.years)
-
-    df_new = _fetch_moex_history_full(symbol, start_ts, end_ts, cfg)
-    if not df_new.empty:
-        _merge_and_save(save_path, df_new)
-        return save_path
-    else:
-        return None  # ничего не сохраняем
+        # Очистка и сохранение
+        final_df['datetime'] = pd.to_datetime(final_df['datetime'])
+        final_df.drop_duplicates(subset=['datetime'], keep='last', inplace=True)
+        final_df.sort_values('datetime', inplace=True)
+        final_df.to_csv(output_path, index=False)
+        
+        return ticker, "updated" if existing_df is not None else "created"
+    except Exception:
+        return ticker, "save_error"
 
 
 def download_all_stocks(
-    tickers: List[str],
-    *,
-    years: int = 20,
-    data_dir: str = "1_data",
-    board: str = "TQBR",
-    processes: Optional[int] = None,
-    sleep_sec: float = 0.0,
-) -> None:
-    """
-    Параллельная загрузка/догрузка по списку тикеров.
-    """
-    if not tickers:
-        print("Список тикеров пуст — пропуск.")
-        return
+    tickers: list[str], years: int, data_dir: str, board: str,
+    processes: int, sleep_sec: float
+):
+    worker_func = partial(
+        download_one_stock_history,
+        years=years, data_dir=data_dir, board=board, sleep_sec=sleep_sec
+    )
+    
+    results_map = {"created": 0, "updated": 0, "no_new_data": 0, "errors": 0}
+    
+    with multiprocessing.Pool(processes=processes) as pool:
+        results = list(tqdm(pool.imap(worker_func, tickers), total=len(tickers), desc="Загрузка акций"))
+        
+    for ticker, status in results:
+        if status in ["created", "updated", "no_new_data"]:
+            if status in results_map:
+                results_map[status] += 1
+        else:
+            results_map["errors"] += 1
+            
+    print("✅ Загрузка акций завершена.")
+    print(f"   - Новых файлов создано: {results_map['created']}")
+    print(f"   - Файлов обновлено: {results_map['updated']}")
+    print(f"   - Актуальных файлов (без изменений): {results_map['no_new_data']}")
+    print(f"   - Ошибок: {results_map['errors']}")
 
-    procs = processes or os.cpu_count() or 1
-    task = partial(download_and_save_ticker, years=years, data_dir=data_dir, board=board, sleep_sec=sleep_sec)
 
-    # Для надёжности кросс-сред — spawn
-    ctx = multiprocessing.get_context("spawn")
-    with ctx.Pool(processes=procs) as pool:
-        for _ in tqdm(pool.imap(task, tickers), total=len(tickers), desc="Загрузка акций"):
-            pass
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Инкрементальная загрузка дневной истории акций MOEX.")
+    parser.add_argument("--years", type=int, default=20, help="Сколько лет истории забирать для НОВЫХ файлов")
+    parser.add_argument("--board", default=DEFAULT_BOARD, help="Доска (по умолчанию TQBR)")
+    parser.add_argument("--data-dir", default="1_data", help="Куда сохранять CSV")
+    parser.add_argument("--universe-file", default="universe.csv", help="CSV со списком тикеров")
+    parser.add_argument("--processes", type=int, default=max(1, (os.cpu_count() or 2)//2), help="Число процессов")
+    parser.add_argument("--sleep-sec", type=float, default=0.0, help="Пауза между тикерами (внутри воркера)")
+    args = parser.parse_args()
+
+    uni_path = Path(PROJECT_ROOT) / args.universe_file
+    if uni_path.exists():
+        df_u = pd.read_csv(uni_path)
+        col = "ticker" if "ticker" in df_u.columns else df_u.columns[0]
+        tickers = df_u[col].dropna().astype(str).unique().tolist()
+    else:
+        print(f"[WARN] Universe-файл {uni_path} не найден.")
+        tickers = []
+
+    if tickers:
+        download_all_stocks(
+            tickers=tickers, years=args.years, data_dir=args.data_dir,
+            board=args.board, processes=args.processes, sleep_sec=args.sleep_sec
+        )

@@ -1,10 +1,12 @@
 # _core/tf_libs.py
-# TensorFlow + Keras импорты с "тихой" настройкой логгирования
-
 import os, sys
 
+# --- ИСПРАВЛЕНО: Добавлена переменная для отключения oneDNN ---
+os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0' 
+# -----------------------------------------------------------
+
 # Тише до импорта
-os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "3")      # 1=INFO, 2=INFO+WARN, 3=ERROR+
+os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "3")
 os.environ.setdefault("ABSL_LOGGING_MIN_LOG_LEVEL", "3")
 
 # Заглушаем самый ранний stderr во время импорта TF
@@ -19,14 +21,20 @@ finally:
         pass
     sys.stderr = __stderr_backup
 
-# Тише после импорта (python-логгеры)
+# Настраиваем GPU и логгеры после импорта
 try:
+    gpus = tf.config.experimental.list_physical_devices('GPU')
+    if gpus:
+        for gpu in gpus:
+            tf.config.experimental.set_memory_growth(gpu, True)
     tf.get_logger().setLevel("ERROR")
     import absl.logging as absl_logging
     absl_logging.set_verbosity(absl_logging.ERROR)
-except Exception:
-    pass
+except Exception as e:
+    print(f"Предупреждение при настройке TensorFlow/GPU: {e}")
 
-from tensorflow.keras import Model, Input, regularizers
-from tensorflow.keras.layers import Dense, Dropout, LSTM, Attention, LayerNormalization
-from tensorflow.keras.callbacks import EarlyStopping, ModelCheckpoint
+# Keras 3 импортируется напрямую
+import keras
+from keras import Model, Input, regularizers
+from keras.layers import Dense, Dropout, LSTM, Attention, LayerNormalization, MultiHeadAttention, GlobalAveragePooling1D, Add
+from keras.callbacks import EarlyStopping, ModelCheckpoint

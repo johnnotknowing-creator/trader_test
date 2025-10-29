@@ -1,105 +1,185 @@
-from _core.paths import PROJECT_ROOT, DATA_DIR, RESULTS_DIR, TOOLS_DIR, CONFIGS_DIR, ensure_dirs, load_dotenv_if_exists
-from _core.libs import *
-load_dotenv_if_exists()
-ensure_dirs()
 # _tools/update_universe.py
+import argparse
+import pandas as pd
+from functools import partial
+import time
+import json
+import os
+import requests
 
-def get_moex_tickers():
+# Импортируем все необходимое из вашего проекта
+from _core.paths import ensure_dirs, RESULTS_DIR
+from _core.libs import tqdm, multiprocessing
+
+ensure_dirs()
+
+# --- Константы, чтобы скрипт был самодостаточным ---
+MOEX_BASE = "https://iss.moex.com/iss/history/engines/stock/markets/shares/boards/{board}/securities"
+DEFAULT_BOARD = "TQBR"
+
+def _make_session() -> requests.Session:
+    """Создает сессию для HTTP-запросов."""
+    s = requests.Session()
+    s.headers.update({"User-Agent": "trader_test/1.0"})
+    return s
+
+def get_initial_moex_tickers():
     """
-    Получает список всех торгуемых акций с Московской биржи, 
-    с динамическим определением столбцов и логированием проблемных ответов.
+    Получает полный список торгуемых акций с Мосбиржи.
     """
     print("Запрашиваю актуальный список акций с Московской биржи...")
-    
-    url = "https://iss.moex.com/iss/engines/stock/markets/shares/boards/TQBR/securities.json"
-    params = {
-        "iss.meta": "off",
-        "iss.only": "securities"
-    }
-    
+    base_url = "https://iss.moex.com/iss/engines/stock/markets/shares/boards/TQBR/securities.json"
+    params = {"iss.meta": "off", "iss.only": "securities,securities.cursor", 'iss.json': 'extended'}
     all_tickers = []
     start = 0
-    last_page_content = None
-
-    while True:
-        data = {}
-        try:
-            page_params = params.copy()
-            page_params['start'] = start
-            
-            response = requests.get(url, params=page_params, timeout=30)
-            response.raise_for_status()
-            data = response.json()
-
-            if 'securities' not in data or not data['securities']['columns']:
-                print("❌ API не вернул ожидаемый блок 'securities'.")
-                return None
-            
-            columns = data['securities']['columns']
-            securities_data = data['securities']['data']
-            
+    
+    with _make_session() as session:
+        while True:
             try:
-                secid_index = columns.index('SECID')
-                # ⏬ --- КЛЮЧЕВОЕ ИСПРАВЛЕНИЕ --- ⏬
-                type_index = columns.index('SECTYPE') # Ищем 'SECTYPE' вместо 'TYPE'
-                # ⏫ --- КОНЕЦ ИСПРАВЛЕНИЯ --- ⏫
-            except ValueError:
-                print("❌ В ответе API отсутствуют необходимые столбцы 'SECID' или 'SECTYPE'.")
+                current_params = params.copy()
+                current_params['securities.cursor'] = start
                 
-                project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-                logs_dir = os.path.join(project_root, "_logs")
-                os.makedirs(logs_dir, exist_ok=True)
+                response = session.get(base_url, params=current_params, timeout=20)
+                response.raise_for_status()
                 
-                timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-                log_file = os.path.join(logs_dir, f"api_response_{timestamp}.json")
-                
-                with open(log_file, 'w', encoding='utf-8') as f:
-                    json.dump(data, f, ensure_ascii=False, indent=4)
-                
-                print(f"⚠️  Полный ответ от API сохранен для анализа в файл: {log_file}")
-                return None
+                data = response.json()
 
-            current_page_content = json.dumps(securities_data)
-            if not securities_data or current_page_content == last_page_content:
-                break
-            last_page_content = current_page_content
+                if not isinstance(data, list) or len(data) < 2:
+                    break
+                
+                data_block = data[1]
+                
+                securities_list = data_block.get('securities')
+                if securities_list and isinstance(securities_list, list):
+                    for row in securities_list:
+                        if isinstance(row, dict) and 'SECID' in row:
+                            all_tickers.append(str(row['SECID']))
+                else:
+                    break
+                
+                cursor_list = data_block.get('securities.cursor')
+                if cursor_list and isinstance(cursor_list, list) and cursor_list:
+                    cursor_data = cursor_list[0]
+                    if isinstance(cursor_data, dict):
+                        total = cursor_data.get('TOTAL', 0)
+                        page_size = cursor_data.get('PAGESIZE', 100)
+                        start += page_size
+                        
+                        if start >= total:
+                            break
+                    else:
+                        break
+                else:
+                    break
+                
+                time.sleep(0.25)
+                
+            except requests.RequestException as e:
+                print(f"⚠️  Сетевая ошибка при получении списка акций: {e}. Прерываю.")
+                return []
+            except Exception as e:
+                print(f"⚠️  Критическая ошибка при получении списка: {e}. Прерываю.")
+                return []
+
+    unique_tickers = sorted(list(set(all_tickers)))
+    print(f"✅ Получено {len(unique_tickers)} уникальных тикеров.")
+    return unique_tickers
+
+
+def get_history_days_count(ticker: str, session: requests.Session) -> dict:
+    """
+    Для одного тикера запрашивает метаданные истории и возвращает количество дней.
+    """
+    url = MOEX_BASE.format(board=DEFAULT_BOARD) + f"/{ticker}.json"
+    params = {'limit': 1, 'iss.json': 'extended', 'iss.meta': 'off'}
+    
+    try:
+        response = session.get(url, params=params, timeout=15)
+        if response.status_code != 200:
+            return {"ticker": ticker, "history_days": 0, "error": f"HTTP status {response.status_code}"}
             
-            for security in securities_data:
-                if len(security) > max(secid_index, type_index):
-                    ticker = security[secid_index]
-                    stock_type = security[type_index]
-                    
-                    # '1'-Common, '2'-Preferred, 'D'-Depositary Receipt. MOEX также использует 'J' для акций.
-                    if stock_type in ['1', '2', 'D', 'J']:
-                        all_tickers.append(ticker)
-            
-            start += len(securities_data)
-            
-        except requests.exceptions.RequestException as e:
-            print(f"❌ Сетевая ошибка при запросе данных с Мосбиржи: {e}")
-            return None
-        except Exception as e:
-            print(f"❌ Непредвиденная ошибка: {e}")
-            return None
-            
-    if not all_tickers:
-        print("⚠️  Не удалось найти ни одного активного тикера. Возможно, временные проблемы с API Мосбиржи.")
+        data = response.json()
+        
+        if isinstance(data, list) and len(data) > 1:
+            history_cursor_block = data[1].get('history.cursor')
+            if history_cursor_block and isinstance(history_cursor_block, list) and history_cursor_block:
+                try:
+                    total_days = history_cursor_block[0].get('TOTAL', 0)
+                    return {"ticker": ticker, "history_days": int(total_days), "error": None}
+                except (ValueError, IndexError):
+                    return {"ticker": ticker, "history_days": 0, "error": "Could not parse 'TOTAL' from data"}
+        
+        return {"ticker": ticker, "history_days": 0, "error": "Unexpected JSON structure"}
+    
+    except requests.exceptions.RequestException as e:
+        return {"ticker": ticker, "history_days": 0, "error": f"Network error: {type(e).__name__}"}
+    except json.JSONDecodeError:
+        return {"ticker": ticker, "history_days": 0, "error": "Invalid JSON response"}
+    except Exception as e:
+        return {"ticker": ticker, "history_days": 0, "error": f"Unexpected error: {e}"}
+
+
+def main(args):
+    """Основной пайплайн: получение списка, проверка истории, фильтрация, сохранение."""
+    
+    initial_tickers = get_initial_moex_tickers()
+    if not initial_tickers:
+        print("❌ Не удалось получить список акций. Завершаю работу.")
+        return
+
+    print(f"\n--- 🕵️ Проверка длины истории для {len(initial_tickers)} тикеров ---")
+    
+    with _make_session() as session:
+        worker_func = partial(get_history_days_count, session=session)
+        
+        with multiprocessing.Pool(processes=args.workers) as pool:
+            results = list(tqdm(pool.imap(worker_func, initial_tickers), total=len(initial_tickers), desc="Анализ истории"))
+
+    report_df = pd.DataFrame(results)
+    
+    # --- ИСПРАВЛЕНИЕ: Сначала очищаем данные, потом сортируем и фильтруем ---
+    # 1. Принудительно конвертируем в числа, все ошибки (нечисловые значения) станут NaN
+    report_df['history_days'] = pd.to_numeric(report_df['history_days'], errors='coerce')
+    # 2. Заполняем все NaN (включая те, что появились после to_numeric) нулями и приводим к целому числу
+    report_df['history_days'] = report_df['history_days'].fillna(0).astype(int)
+    
+    # 3. Теперь, когда колонка чистая, сортируем
+    report_df.sort_values('history_days', ascending=False, inplace=True)
+    
+    report_path = RESULTS_DIR / "universe_full_report.csv"
+    report_df.to_csv(report_path, index=False)
+    print(f"\n📊 Полный отчет о длине истории сохранен в: {report_path}")
+    
+    errors_df = report_df[report_df['error'].notna()]
+    if not errors_df.empty:
+        print("\n--- ⚠️ Обнаружены проблемы при проверке тикеров ---")
+        error_counts = errors_df['error'].value_counts()
+        print(error_counts.to_string())
+        print("----------------------------------------------------")
+
+    # 4. Теперь фильтрация будет работать корректно
+    filtered_df = report_df[report_df['history_days'] >= args.min_days]
+    filtered_tickers = filtered_df['ticker'].tolist()
+
+    print("\n" + "="*50)
+    print("--- 🔬 Итоги фильтрации ---")
+    print(f"Всего проанализировано: {len(report_df)} тикеров")
+    print(f"Прошли фильтр (история >= {args.min_days} дней): {len(filtered_tickers)} тикеров")
+    print(f"Отброшено: {len(report_df) - len(filtered_tickers)} тикеров")
+    print("="*50)
+    
+    if filtered_tickers:
+        universe_df = pd.DataFrame(filtered_tickers, columns=['ticker'])
+        universe_df.to_csv(args.output_file, index=False)
+        print(f"\n✅ Обновленный и отфильтрованный `universe.csv` сохранен.")
     else:
-        print(f"✅ Получено {len(all_tickers)} активных тикеров.")
-
-    return sorted(list(set(all_tickers)))
+        print(f"\n⚠️ После фильтрации не осталось ни одного тикера. Файл `{args.output_file}` не был сохранен.")
 
 if __name__ == "__main__":
-    project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    universe_file_path = os.path.join(project_root, "universe.csv")
+    parser = argparse.ArgumentParser(description="Обновление и фильтрация списка акций MOEX по длине истории.")
+    parser.add_argument('--min-days', type=int, default=252, help="Минимальное количество торговых дней в истории.")
+    parser.add_argument('--output-file', type=str, default='universe.csv', help="Имя выходного файла со списком тикеров.")
+    parser.add_argument('--workers', type=int, default=os.cpu_count(), help="Количество параллельных процессов.")
     
-    tickers = get_moex_tickers()
-    
-    if tickers is not None:
-        # Проверяем, что список не пустой перед сохранением
-        if tickers:
-            universe_df = pd.DataFrame(tickers, columns=['ticker'])
-            universe_df.to_csv(universe_file_path, index=False)
-            print(f"✅ Список тикеров успешно сохранен в файл: {universe_file_path}")
-        else:
-            print("⚠️ Итоговый список тикеров пуст. Файл universe.csv не был изменен.")
+    args = parser.parse_args()
+    main(args)

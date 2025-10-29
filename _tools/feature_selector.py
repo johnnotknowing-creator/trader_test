@@ -1,79 +1,172 @@
-from _core.paths import PROJECT_ROOT, DATA_DIR, RESULTS_DIR, TOOLS_DIR, CONFIGS_DIR, ensure_dirs, load_dotenv_if_exists
-from _core.libs import *
-load_dotenv_if_exists()
-ensure_dirs()
-# _tools/feature_selector.py
-from _core.data_loader import load_data
-from _core.feature_generator import create_features
+import argparse
+import json
+import warnings
+from pathlib import Path
+import pandas as pd
+import numpy as np
+import catboost as cb
+from tqdm import tqdm
+from sklearn.model_selection import StratifiedKFold
+from sklearn.inspection import permutation_importance
+from sklearn.metrics import log_loss
+import gc
 
-CONFIG = {
-    "HORIZON": 20,
-    "TOP_N_FEATURES": 25,
-}
+# --- Настройка путей ---
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+RESULTS_DIR = PROJECT_ROOT / "2_results"
 
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Отбор признаков с помощью LightGBM.")
-    parser.add_argument('--model_name', type=str, required=True, help='Уникальное имя для сохранения списка признаков.')
-    parser.add_argument('--universe_file', type=str, required=True, help='Путь к файлу со списком тикеров.')
-    args = parser.parse_args()
+warnings.filterwarnings("ignore", category=UserWarning, module='catboost')
 
-    data_dir = os.path.join(PROJECT_ROOT, "1_data")
-    universe_path = os.path.join(PROJECT_ROOT, args.universe_file)
+def load_features_from_files(source_dir: Path, n_files: int = None) -> pd.DataFrame:
+    """Загружает признаки из CSV-файлов в указанной директории."""
+    print(f"Загрузка файлов с признаками из: {source_dir}")
+    files = sorted(list(source_dir.glob("*.csv")))
+    if not files:
+        raise FileNotFoundError(f"В директории {source_dir} не найдено CSV файлов.")
+    
+    if n_files:
+        files = files[:n_files]
+        
+    df_list = [pd.read_csv(f) for f in tqdm(files, desc="Загрузка файлов с признаками")]
+    return pd.concat(df_list, ignore_index=True)
+
+def filter_by_correlation(df: pd.DataFrame, threshold: float) -> list:
+    """Фильтрует признаки по порогу корреляции."""
+    if threshold >= 1.0:
+        print("Порог корреляции >= 1.0, фильтрация пропускается.")
+        return df.columns.tolist()
+        
+    print(f"Фильтрация {df.shape[1]} признаков с порогом корреляции {threshold}...")
+    corr_matrix = df.corr().abs()
+    upper = corr_matrix.where(np.triu(np.ones(corr_matrix.shape), k=1).astype(bool))
+    to_drop = [column for column in upper.columns if any(upper[column] > threshold)]
+    
+    kept_features = df.drop(columns=to_drop).columns.tolist()
+    print(f"Осталось {len(kept_features)} признаков после фильтрации.")
+    return kept_features
+
+def calculate_loss_importance_for_fold(model, X_val, y_val):
+    """
+    Рассчитывает Permutation Importance на основе logloss для одного фолда.
+    """
+    importances = {}
+    baseline_preds = model.predict_proba(X_val)
+    baseline_loss = log_loss(y_val, baseline_preds)
+
+    for col in X_val.columns:
+        X_val_permuted = X_val.copy()
+        
+        permuted_values = X_val_permuted[col].to_numpy()
+        np.random.shuffle(permuted_values)
+        X_val_permuted[col] = permuted_values
+        
+        permuted_preds = model.predict_proba(X_val_permuted)
+        permuted_loss = log_loss(y_val, permuted_preds)
+        
+        importances[col] = permuted_loss - baseline_loss
+        
+    return importances
+
+def main(args):
+    source_dir = RESULTS_DIR / args.source_dir_name
     
     try:
-        tickers_df = pd.read_csv(universe_path)
-        all_csv_files = [os.path.join(data_dir, f"{ticker}_D1_MOEX.csv") for ticker in tickers_df['ticker'].dropna().unique()]
-        print(f"Найдено {len(all_csv_files)} тикеров для обработки.")
-    except FileNotFoundError:
-        print(f"❌ Файл со списком тикеров не найден: {universe_path}"); exit()
+        df = load_features_from_files(source_dir)
+    except FileNotFoundError as e:
+        print(f"❌ Ошибка: {e}"); return
 
-    print("--- Подготовка данных по индексу IMOEX ---")
-    index_raw_df = load_data(os.path.join(data_dir, "IMOEX.csv"))
-    index_df = index_raw_df.copy()
-    for period in [10, 20, 50]:
-        index_df[f'index_roc_{period}'] = ta.roc(index_df['close'], length=period)
-    index_df.reset_index(inplace=True)
+    df.replace([np.inf, -np.inf], np.nan, inplace=True)
+    
+    exclude_cols = {'datetime', 'ticker', 'label', 'meta_target', 'open', 'high', 'low', 'close', 'volume'}
+    feature_cols = [col for col in df.columns if col not in exclude_cols]
+    
+    # --- 👇👇👇 ЕДИНСТВЕННОЕ ИЗМЕНЕНИЕ ЗДЕСЬ 👇👇👇 ---
+    # Был исправлен синтаксис заполнения пропусков, чтобы убрать `FutureWarning` от pandas.
+    # Логика осталась абсолютно идентичной.
+    for col in tqdm(feature_cols, desc="Заполнение пропусков"):
+        if df[col].isnull().any():
+            # Старая строка: df[col].fillna(df[col].median(), inplace=True)
+            df[col] = df[col].fillna(df[col].median())
+    # --- 👆👆👆 КОНЕЦ ИЗМЕНЕНИЯ 👆👆👆 ---
 
-    print("--- Сбор данных для обучения селектора ---")
-    all_train_dfs = []
-    for file_path in tqdm(all_csv_files, desc="Сбор данных"):
-        df = load_data(file_path)
-        if df is None or len(df) < 500: continue
+    X = df[feature_cols]
+    y = df['label']
+    del df; gc.collect()
+    
+    all_importances = []
+    
+    print(f"\n--- 🚀 Запуск отбора признаков по метрике: '{args.ranking_metric.upper()}' ---")
+    
+    for r in range(args.repeats):
+        print(f"\n--- Повтор [{r + 1}/{args.repeats}] ---")
+        skf = StratifiedKFold(n_splits=args.n_splits, shuffle=True, random_state=42 + r)
         
-        df_features = create_features(df, index_df=index_df, horizon=CONFIG["HORIZON"])
-        if df_features.empty: continue
+        for fold, (train_idx, val_idx) in enumerate(skf.split(X, y)):
+            print(f"  Фолд [{fold + 1}/{args.n_splits}]...")
+            X_train, X_val = X.iloc[train_idx], X.iloc[val_idx]
+            y_train, y_val = y.iloc[train_idx], y.iloc[val_idx]
+
+            model = cb.CatBoostClassifier(
+                iterations=500, learning_rate=0.05, depth=6,
+                loss_function='MultiClass', eval_metric='Accuracy',
+                random_seed=42, verbose=0, task_type="GPU" if args.use_gpu else "CPU",
+                early_stopping_rounds=50
+            )
             
-        df_features['datetime'] = pd.to_datetime(df_features['datetime'])
-        train_df = df_features[df_features['datetime'] < (df_features['datetime'].max() - relativedelta(years=1))].copy()
-        all_train_dfs.append(train_df)
-    
-    if not all_train_dfs: 
-        print("❌ Не удалось собрать данные для анализа."); exit()
-        
-    combined_df = pd.concat(all_train_dfs, ignore_index=True)
-    print(f"✅ Данные собраны. Общее количество записей: {len(combined_df)}")
+            model.fit(X_train, y_train, eval_set=(X_val, y_val), early_stopping_rounds=50, verbose=0)
+            
+            fold_importances = {}
+            if args.ranking_metric == 'loss':
+                fold_importances = calculate_loss_importance_for_fold(model, X_val, y_val)
+            else: # 'accuracy'
+                result = permutation_importance(
+                    model, X_val, y_val, n_repeats=1, random_state=42, n_jobs=-1
+                )
+                for i, feat in enumerate(X_val.columns):
+                    fold_importances[feat] = result.importances_mean[i]
+            
+            all_importances.append(fold_importances)
+            del X_train, X_val, y_train, y_val, model; gc.collect()
 
-    print("--- Обучение LightGBM и отбор признаков ---")
-    feature_columns = [col for col in combined_df.columns if col not in ['datetime', 'target']]
-    X_train = combined_df[feature_columns]
-    y_train = combined_df['target']
+    ranked_features = pd.DataFrame(all_importances).mean()
     
-    model = lgb.LGBMClassifier(random_state=42)
-    model.fit(X_train, y_train)
+    if args.ranking_metric == 'loss':
+        ranked_features.sort_values(ascending=True, inplace=True)
+        print("\n--- Рейтинг признаков по ВЛИЯНИЮ НА LOSS (отрицательные = вредные) ---")
+        print("   loss_impact < 0: Вредный признак (удаление улучшает/уменьшает loss)")
+        print("   loss_impact > 0: Полезный признак (удаление ухудшает/увеличивает loss)")
+    else: # 'accuracy'
+        ranked_features.sort_values(ascending=False, inplace=True)
+        print("\n--- Рейтинг признаков по ВЛИЯНИЮ НА ТОЧНОСТЬ (положительные = полезные) ---")
 
-    feature_importances = pd.DataFrame({'feature': X_train.columns, 'importance': model.feature_importances_})
-    top_features_df = feature_importances.sort_values('importance', ascending=False).head(CONFIG["TOP_N_FEATURES"])
+    kept_after_corr = filter_by_correlation(X[ranked_features.head(args.top_n).index], args.corr_threshold)
+    final_feature_list = [feat for feat in ranked_features.index if feat in kept_after_corr]
     
-    print("\n--- Рейтинг признаков по версии LightGBM ---")
-    print(top_features_df.to_string())
-    
-    top_features_list = top_features_df['feature'].tolist()
-    
-    results_dir = os.path.join(PROJECT_ROOT, "2_results")
-    os.makedirs(results_dir, exist_ok=True)
-    file_path = os.path.join(results_dir, f"selected_features_{args.model_name}.json")
-    
-    with open(file_path, 'w') as f:
-        json.dump(top_features_list, f, indent=4)
+    if len(final_feature_list) > args.top_n:
+        final_feature_list = final_feature_list[:args.top_n]
+
+    print(f"\n--- Итоговый рейтинг (топ-20) ---")
+    print(ranked_features.head(20).to_string())
+
+    output_path = RESULTS_DIR / f"selected_features_{args.model_name}.json"
+    with open(output_path, 'w', encoding='utf-8') as f:
+        json.dump(final_feature_list, f, ensure_ascii=False, indent=4)
         
-    print(f"\n✅ Список из {len(top_features_list)} признаков сохранен в: {file_path}")
+    print(f"\n✅ Список из {len(final_feature_list)} признаков сохранен в: {output_path}")
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Select best features using CatBoost and correlation filtering.")
+    parser.add_argument("--model_name", type=str, required=True, help="A unique name for the final selected feature set.")
+    parser.add_argument("--source_dir_name", type=str, default="features_processed", 
+                        help="Name of the source directory inside 2_results (e.g., 'features_processed' or 'features_combined/your_name').")
+    parser.add_argument("--ranking_metric", type=str, default="accuracy", choices=["accuracy", "loss"], 
+                        help="Metric to use for permutation importance: 'accuracy' (default) or 'loss'.")
+    parser.add_argument("--top_n", type=int, default=160, help="Number of top features to consider for correlation filtering and final selection.")
+    parser.add_argument("--corr_threshold", type=float, default=1.0, help="Correlation threshold to filter features.")
+    parser.add_argument("--repeats", type=int, default=1, help="Number of times to repeat the cross-validation process for stable importance scores.")
+    parser.add_argument("--n_splits", type=int, default=5, help="Number of splits for StratifiedKFold cross-validation.")
+    parser.add_argument("--use_gpu", action='store_true', help="Use GPU for CatBoost training.")
+    
+    args = parser.parse_args()
+    main(args)
